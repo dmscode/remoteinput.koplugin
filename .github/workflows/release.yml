@@ -1,0 +1,67 @@
+# This is a GitHub Action workflow to automate the release process.
+# For more information about GitHub Actions, see: https://docs.github.com/en/actions
+
+name: Create Release
+
+# Controls when the workflow will run.
+on:
+  # Triggers the workflow on push events, but only for tags that start with 'v'.
+  # For example: v1.0, v1.2.3, v2.0-beta
+  push:
+    tags:
+      - 'v*'
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel.
+jobs:
+  # This workflow contains a single job called "build_and_release".
+  build_and_release:
+    # The type of runner that the job will run on.
+    runs-on: ubuntu-latest
+    # Grant permissions for the GITHUB_TOKEN to create a release.
+    permissions:
+      contents: write
+
+    # Steps represent a sequence of tasks that will be executed as part of the job.
+    steps:
+      # Step 1: Check out your repository under $GITHUB_WORKSPACE, so your job can access it.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Go environment
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: false
+
+      # Step 3: Update version in _meta.lua based on the Git tag.
+      - name: Update version in _meta.lua
+        run: |
+          # Extract version from tag (e.g., v1.2.3 -> 1.2.3)
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "Updating version to ${VERSION} in _meta.lua"
+          # Use sed to replace only the version number, preserving the rest of the line (like the trailing comma).
+          # This ensures the version is stored as a string, enclosed in double quotes.
+          sed -i -E "s/(version\s*=\s*)[^,]+/\1\"${VERSION}\"/" _meta.lua
+          cat _meta.lua
+
+      # Step 4: Run build.sh to create architecture-specific zip files
+      - name: Build and package
+        run: bash ./build.sh
+
+      # Step 5: List files in the created archives for debugging purposes.
+      - name: List archive contents
+        run: |
+          for zipfile in build/*.zip; do
+            echo "Contents of $zipfile:"
+            unzip -l "$zipfile"
+          done
+
+      # Step 6: Create a GitHub Release and upload the archives as release assets.
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          # Mark this release as a pre-release. Set to 'false' to create a full release.
+          prerelease: true
+          # The files to upload as release assets.
+          files: build/*.zip
