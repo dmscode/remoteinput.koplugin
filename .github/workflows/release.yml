@@ -31,7 +31,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.21'
+          go-version: '1.24'
           cache: false
 
       # Step 3: Update version in _meta.lua based on the Git tag.

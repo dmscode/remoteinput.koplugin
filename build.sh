@@ -53,6 +53,9 @@ cp *.lua "$BUILD_DIR/$PLUGIN_NAME/"
 if [ -f "README.md" ]; then
     cp README.md "$BUILD_DIR/$PLUGIN_NAME/"
 fi
+if [ -f "README.zh-CN.md" ]; then
+    cp README.zh-CN.md "$BUILD_DIR/$PLUGIN_NAME/"
+fi
 if [ -f "LICENSE" ]; then
     cp LICENSE "$BUILD_DIR/$PLUGIN_NAME/"
 fi

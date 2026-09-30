@@ -20,10 +20,13 @@ KOReader minimum version: 2025.10 — other versions may not be supported.
 - **Bidirectional sync**: edits made locally on the reader are also reflected back to the web page.
 - **Persistent connection**: the server stays alive after a save, so there is no need to re-scan the QR code.
 - **Seamless context switching**: switch between annotation editing and any input dialog without reconnecting.
+- **Automatic input following**: while a session is active, any text input dialog opened on the reader silently takes over the remote context — the web page follows along within a second, no button taps needed.
 - **Conflict-free two-way editing**: a `dirty`-flag state machine ensures "whoever is typing wins" and the other side never clobbers it.
+- **Idle auto-stop**: the server shuts itself down after a configurable period of inactivity (Off / 5 / 15 / 30 / 60 minutes).
+- **Low-power friendly**: adaptive polling backs off when idle or when the page is hidden, minimizing load on slow devices and phone batteries.
 - **Remote Note**: type notes for passages you highlight within a book.
 - **Remote Input**: a "Remote input" button is injected into standard KOReader text dialogs so you can fill them from a remote device.
-- **RESTful JSON API** (`/api/state`, `/api/text`, `/api/submit`) with a zero-dependency JSON encoder.
+- **RESTful JSON API** (`/api/state`, `/api/text`, `/api/submit`) with a self-contained, fully spec-compliant JSON encoder/decoder.
 - **Optional HTTPS** with auto-generated self-signed TLS certificates.
 
 ## Installation
@@ -51,7 +54,7 @@ Releases are produced automatically by a GitHub Actions workflow (copied and ada
 
 1. Sets the version in `_meta.lua` to match the tag.
 2. Cross-compiles the `certgen` Go binary (in [`certgen/`](certgen/)) for `armv7`, `arm64`, `arm-legacy`, and `x86_64`.
-3. Packages one zip per architecture — each containing the plugin's Lua sources, `README.md`, `LICENSE`, and the matching `bin/certgen` — via [`build.sh`](build.sh).
+3. Packages one zip per architecture — each containing the plugin's Lua sources, `README.md`, `README.zh-CN.md`, `LICENSE`, and the matching `bin/certgen` — via [`build.sh`](build.sh).
 4. Creates a GitHub Release (marked as a pre-release by default) and uploads the four zips as assets.
 
 ### Building locally
@@ -71,7 +74,11 @@ Settings can be accessed from the Top Menu: **Tools > Remote Input**.
 
 ### Port
 
-By default, the server runs on port 8089. You can change it here.
+By default, the server runs on port 8089. You can change it here. A new port takes effect from the next session.
+
+### Auto-stop after inactivity
+
+The server stops itself after the selected period without *real* activity (text edits, context switches, page loads — background polling alone does not keep it alive). Cycle through **Off / 5 / 15 / 30 / 60** minutes; the default is 15. When the timeout fires, the reader shows a notice and any open web page switches to "Session ended". Stopping manually — the device's **Stop** button or the web **Save & Close** — always works immediately.
 
 ### Enable HTTPS (Encryption)
 
@@ -86,6 +93,10 @@ Forces the generation of new HTTPS certificates. (Only visible when HTTPS is ena
 ### Allow remote input in all text input dialogs
 
 Toggles the injection of the Remote Input functionality globally across the KOReader UI. Requires a restart to take effect after changing. Enabled by default.
+
+### Follow newly opened input dialogs
+
+While a session is active, opening any text input dialog on the reader and bringing up its keyboard switches the remote context to that dialog automatically — the web page follows without tapping "Remote input" again. Note dialogs are excluded: use their "Remote edit note" button to switch to annotation editing. Enabled by default.
 
 ### Render inline 'Remote input' button
 
@@ -107,9 +118,11 @@ RemoteInput embeds a small HTTP server on the reader and serves an interactive s
 Both sides run a tiny state machine to avoid edit conflicts:
 
 - A `dirty` flag marks which side is actively editing. When the browser is typing (`isDirty = true`), it owns the text and KOReader never overwrites it.
-- When the browser is idle and KOReader detects a local change (`server_dirty`), the web page adopts the reader's text on the next poll.
-- A context `version` counter lets the frontend detect a context switch (e.g. moving to a different input field) and reset itself without a reload.
+- When the browser is idle and KOReader detects a local change (`server_dirty`), the web page adopts the reader's text on the next poll. Other open tabs also pick up remote edits this way.
+- A context `version` counter is bumped **only** on context switches (e.g. moving to a different input field), so the frontend can reset itself without a reload — and can never confuse an ordinary text update with a switch that would clobber the side that is typing.
+- Each session has a random id (`sid`); if the reader starts a new session, older web pages detect the mismatch and end themselves instead of resurrecting stale state.
 - A 10-second safety timer releases the `dirty` flag automatically so a network failure can never permanently lock out the other side.
+- The polling interval adapts automatically: 600 ms right after interaction, 2 s when idle, 5 s when the page is in the background.
 
 ## Differences from RemoteNote
 
@@ -123,11 +136,11 @@ Both sides run a tiny state machine to avoid edit conflicts:
 | **Conflict handling** | None (last writer wins) | `dirty`-flag state machine with a 10 s safety release |
 | **Frontend** | Minimal HTML form | Styled single-page app with status indicator and hints |
 | **API** | Plain `POST` form data | RESTful JSON API (`/api/state`, `/api/text`, `/api/submit`) |
-| **Dependencies** | Relies on `socket.url` for decoding | Self-contained JSON encoder + URL decoding (no external deps) |
+| **Dependencies** | Relies on `socket.url` for decoding | Self-contained JSON encoder/decoder + URL decoding (no external deps) |
 | **Session state** | None | Tracks `session_active`, `context_version`, `server_dirty` |
 | **Annotation submit** | Implicit (form submit = save) | Explicit **Save & Close** button |
 | **Plugin name** | `remotenote` / "Remote Note" | `remoteinput` / "Remote Input" |
-| **Version** | 0.1.0 | 0.1.0 (initial fork version, tag-driven bumps) |
+| **Version** | 0.1.0 | Tag-driven automatic bumps (see Releases) |
 
 ### What was carried over unchanged
 

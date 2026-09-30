@@ -22,68 +22,93 @@ local T               = require("ffi/util").template
 local joinPath        = require("ffi/util").joinPath
 local Font            = require("ui/font")
 local util            = require("util")
+local jsonutil        = require("jsonutil")
 
 local current_plugin_dir = string.match(debug.getinfo(1).source, "^@(.*/)")
 local cert_path = joinPath(current_plugin_dir, "cert.pem")
 local key_path = joinPath(current_plugin_dir, "key.pem")
 
+-- 单个请求体的上限，防止异常客户端把内存吃爆
+local MAX_BODY_SIZE = 2 * 1024 * 1024
+
+local STATUS_TEXT = { [200] = "OK", [400] = "Bad Request", [404] = "Not Found" }
+
 local function get_local_ip()
-  local udp = assert(socket.udp())
-  udp:setpeername("8.8.8.8", 53)
-  local ip, port = udp:getsockname()
+  local ok, udp = pcall(socket.udp)
+  if not ok or not udp then
+    return nil
+  end
+  -- 连接一个外部地址只是为了拿到出口路由对应的本机 IP，不会真正发包
+  local ok_peer = udp:setpeername("8.8.8.8", 53)
+  local ip
+  if ok_peer then
+    ip = udp:getsockname()
+  end
   udp:close()
-  return ip, port
+  if not ip or ip == "" or ip == "0.0.0.0" then
+    return nil
+  end
+  return ip
 end
 
 local function generateCerts(callback)
   local certgen_path = joinPath(current_plugin_dir, "bin/certgen")
-  if util.pathExists(certgen_path) then
-    local cmd = string.format("cd %s && ./%s", current_plugin_dir, "bin/certgen")
-    logger.dbg("RemoteInput: Running command: " .. cmd)
-    local msg = InfoMessage:new {
-      text = _("Generating TLS certificates"),
-      dismissable = false,
-    }
-    UIManager:show(msg)
-    UIManager:nextTick(function ()
-      os.execute(cmd)
-      UIManager:close(msg)
-      callback()
-    end)
-  else
+  if not util.pathExists(certgen_path) then
     UIManager:show(InfoMessage:new {
       text = T(_("Error: TLS certificate generator binary (%1) not found."), certgen_path),
     })
+    callback(false)
+    return
   end
+  local msg = InfoMessage:new {
+    text = _("Generating TLS certificates"),
+    dismissable = false,
+  }
+  UIManager:show(msg)
+  UIManager:nextTick(function ()
+    -- 路径加引号，避免含空格的安装路径导致命令失败
+    local cmd = string.format("cd '%s' && ./bin/certgen", current_plugin_dir)
+    logger.dbg("RemoteInput: Running command: " .. cmd)
+    os.execute(cmd)
+    UIManager:close(msg)
+    -- 以证书文件是否生成为准，规避 os.execute 返回值的平台差异
+    local success = util.pathExists(cert_path) and util.pathExists(key_path)
+    if not success then
+      logger.err("RemoteInput: TLS certificate generation failed")
+      UIManager:show(InfoMessage:new {
+        text = _("TLS certificate generation failed."),
+      })
+    end
+    callback(success)
+  end)
 end
 
 local function ensureCerts(callback)
-  if not (util.pathExists(cert_path) and util.pathExists(key_path)) then
-    generateCerts(function()
-      callback()
-    end)
+  if util.pathExists(cert_path) and util.pathExists(key_path) then
+    callback(true)
   else
-    callback()
+    generateCerts(callback)
   end
 end
 
--- ==================== JSON 编码器 ====================
--- 为 API 响应提供轻量 JSON 编码，无需外部依赖
-local function jsonEncode(val)
-  if type(val) == "string" then
-    return '"' .. val:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t') .. '"'
-  elseif type(val) == "number" then
-    return tostring(val)
-  elseif type(val) == "boolean" then
-    return val and "true" or "false"
-  elseif type(val) == "table" then
-    local parts = {}
-    for k, v in pairs(val) do
-      table.insert(parts, jsonEncode(k) .. ':' .. jsonEncode(v))
-    end
-    return '{' .. table.concat(parts, ',') .. '}'
-  end
-  return 'null'
+-- ==================== Kindle 防火墙 ====================
+local function addFirewallRules(port)
+  if not Device:isKindle() or not port then return end
+  -- 先用 -C 查重再 -A，避免规则重复累积
+  os.execute(string.format(
+    "iptables -C INPUT -p tcp --dport %d -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT 2>/dev/null || " ..
+    "iptables -A INPUT -p tcp --dport %d -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT", port, port))
+  os.execute(string.format(
+    "iptables -C OUTPUT -p tcp --sport %d -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null || " ..
+    "iptables -A OUTPUT -p tcp --sport %d -m conntrack --ctstate ESTABLISHED -j ACCEPT", port, port))
+end
+
+local function removeFirewallRules(port)
+  if not Device:isKindle() or not port then return end
+  os.execute(string.format(
+    "iptables -D INPUT -p tcp --dport %d -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT 2>/dev/null", port))
+  os.execute(string.format(
+    "iptables -D OUTPUT -p tcp --sport %d -m conntrack --ctstate ESTABLISHED -j ACCEPT 2>/dev/null", port))
 end
 
 -- ==================== HTTP 工具 ====================
@@ -92,29 +117,34 @@ local function readRequestBody(client, headers)
   if not content_length then
     return nil, "Content-Length missing"
   end
+  if content_length > MAX_BODY_SIZE then
+    return nil, "body too large"
+  end
   local body, err = client:receive(content_length)
   return body, err
 end
 
-local function sendJsonResponse(client, data, status)
+local function httpRespond(client, status, content_type, body, extra_headers)
   status = status or 200
-  local body = jsonEncode(data)
-  local resp = "HTTP/1.0 " .. tostring(status) .. " OK\r\nContent-Type: application/json\r\nContent-Length: " .. tostring(#body) .. "\r\nAccess-Control-Allow-Origin: *\r\n\r\n" .. body
-  client:send(resp)
+  local head = "HTTP/1.0 " .. tostring(status) .. " " .. (STATUS_TEXT[status] or "OK") ..
+    "\r\nContent-Type: " .. content_type ..
+    "\r\nContent-Length: " .. tostring(#body) ..
+    (extra_headers or "") .. "\r\n\r\n" .. body
+  client:send(head)
   client:close()
+end
+
+local function sendJsonResponse(client, data, status)
+  httpRespond(client, status or 200, "application/json", jsonutil.encode(data),
+    "\r\nAccess-Control-Allow-Origin: *")
 end
 
 local function sendHtmlResponse(client, html, status)
-  status = status or 200
-  local resp = "HTTP/1.0 " .. tostring(status) .. " OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: " .. tostring(#html) .. "\r\n\r\n" .. html
-  client:send(resp)
-  client:close()
+  httpRespond(client, status or 200, "text/html; charset=utf-8", html)
 end
 
 local function sendEmptyResponse(client, status)
-  status = status or 200
-  client:send(string.format("HTTP/1.0 %d OK\r\nContent-Length: 0\r\n\r\n", status))
-  client:close()
+  httpRespond(client, status or 200, "text/plain", "")
 end
 
 -- ==================== 主体插件 ====================
@@ -128,12 +158,17 @@ function RemoteInput:init()
   self.https_enabled = G_reader_settings:isTrue("remoteinput_https_enabled")
   self.render_inline_button = G_reader_settings:isTrue("remoteinput_render_inline_button")
   self.inject_remote_input = G_reader_settings:readSetting("remoteinput_inject_remote_input") ~= false
+  self.auto_switch = G_reader_settings:readSetting("remoteinput_autoswitch") ~= false
+  local idle_minutes = G_reader_settings:readSetting("remoteinput_idle_minutes")
+  self.idle_minutes = idle_minutes == nil and 15 or idle_minutes
   self.dialog_font_face = Font:getFace("infofont")
   -- 持久会话状态
+  self.session_gen = 0
   self.context_version = 0
   self.session_active = false
   self.last_known_remote_text = ""
   self.server_dirty = false
+  self.last_activity = 0
   self.ui.menu:registerToMainMenu(self)
   if self.ui.highlight then
     self.ui.highlight:addToHighlightDialog("20_remoteinput", function(highlight_manager, index)
@@ -174,44 +209,74 @@ function RemoteInput:init()
     end
   end
 
+  -- 文档关闭时结束会话：不删除任何批注，已输入的内容随文档正常保存。
+  -- 没有这一步，换书/关书后旧实例会继续持有服务器，甚至把远程文本写进新书。
+  if self.ui.onClose then
+    local ui_onClose = self.ui.onClose
+    self.ui.onClose = function(ui_self, ...)
+      self:abortSession()
+      return ui_onClose(ui_self, ...)
+    end
+  end
+
   if InputDialog.init and not InputDialog._remoteinput_hooked then
     local old_init = InputDialog.init
     InputDialog.init = function(dialog, ...)
-      if not self.inject_remote_input or dialog.inputtext_class ~= InputText then
-        return old_init(dialog, ...)
-      end
-      local remote_input_button_table = {
-        text = _("Remote input"),
-        id = "remote_input",
-        keep_menu_open = true,
-        callback = function()
-          local connect_callback = function()
-            self:openRemoteSession("input", { input_dialog = dialog })
-          end
-          NetworkMgr:runWhenConnected(connect_callback)
-        end,
-      }
-      if self.render_inline_button then
-        local already_added = false
-        if dialog.buttons then
-          for _, row in ipairs(dialog.buttons) do
-            for _, btn in ipairs(row) do
-              if btn.id == "remote_input" then
-                already_added = true
-                break
+      local inject = self.inject_remote_input
+        and not dialog._remoteinput_skip
+        and dialog.inputtext_class == InputText
+      local remote_input_button_table
+      if inject then
+        remote_input_button_table = {
+          text = _("Remote input"),
+          id = "remote_input",
+          keep_menu_open = true,
+          callback = function()
+            NetworkMgr:runWhenConnected(function()
+              self:openRemoteSession("input", { input_dialog = dialog })
+            end)
+          end,
+        }
+        if self.render_inline_button then
+          local already_added = false
+          if dialog.buttons then
+            for _, row in ipairs(dialog.buttons) do
+              for _, btn in ipairs(row) do
+                if btn.id == "remote_input" then
+                  already_added = true
+                  break
+                end
               end
             end
+          else
+            dialog.buttons = {{}}
           end
-        else
-          dialog.buttons = {{}}
+          if not already_added then
+            if not dialog.buttons[1] then dialog.buttons[1] = {} end
+            table.insert(dialog.buttons[1], 1, remote_input_button_table)
+          end
         end
-        if not already_added then
-          if not dialog.buttons[1] then dialog.buttons[1] = {} end
-          table.insert(dialog.buttons[1], 1, remote_input_button_table)
+      end
+      -- 自动跟随：会话活跃时，任何新输入框获得键盘焦点即静默切换远程上下文。
+      -- 钩子在 old_init 之前挂上（覆盖 init 期间就弹出键盘的对话框），
+      -- 切换本身用 nextTick 延迟，避免在对话框构造过程中重入 UI 流程，
+      -- 也给笔记弹窗留出设置 no_autoswitch 标志的机会。
+      local follow = self.session_active and self.auto_switch and self.context_type
+        and not dialog._remoteinput_skip
+        and dialog.inputtext_class == InputText
+        and not dialog._remoteinput_osk_patched
+      if follow then
+        local old_osk = dialog.onShowKeyboard
+        dialog._remoteinput_osk_patched = true
+        dialog.onShowKeyboard = function(dlg, ...)
+          if old_osk then old_osk(dlg, ...) end
+          UIManager:nextTick(function()
+            self:autoSwitchToInputDialog(dialog)
+          end)
         end
-        return old_init(dialog, ...)
-      else
-        local ret = old_init(dialog, ...)
+      end
+      local ret = old_init(dialog, ...)
+      if inject and not self.render_inline_button then
         dialog.init = old_init
         if not dialog._remoteInputWidgetAdded then
           dialog._remoteInputWidgetAdded = true
@@ -224,8 +289,8 @@ function RemoteInput:init()
           }
           dialog:addWidget(btn_table)
         end
-        return ret
       end
+      return ret
     end
     InputDialog._remoteinput_hooked = true
   end
@@ -235,14 +300,7 @@ end
 function RemoteInput:CloseServer()
   if self.server then
     logger.info("RemoteInput: Closing server")
-    if Device:isKindle() then
-      os.execute(string.format("%s %s %s",
-        "iptables -D INPUT -p tcp --dport", self.port,
-        "-m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"))
-      os.execute(string.format("%s %s %s",
-        "iptables -D OUTPUT -p tcp --sport", self.port,
-        "-m conntrack --ctstate ESTABLISHED -j ACCEPT"))
-    end
+    removeFirewallRules(self.server_port or self.port)
     UIManager:removeZMQ(self.server)
     self.server:stop()
     self.server = nil
@@ -252,10 +310,13 @@ end
 
 function RemoteInput:startServer(callback)
   if self.https_enabled then
-    ensureCerts(function()
-      self.server = SecureTCPServer:new {
+    ensureCerts(function(success)
+      if not success then
+        return
+      end
+      local server = SecureTCPServer:new {
         host = "*",
-        port = self.port,
+        port = self.server_port,
         ssl_params = {
           mode = "server",
           protocol = "any",
@@ -267,12 +328,21 @@ function RemoteInput:startServer(callback)
           return self:handleRequest(data, client, client_ip)
         end,
       }
+      -- SSL 上下文创建失败时拒绝启动，绝不静默降级为明文服务
+      if not server.ssl_ctx then
+        logger.err("RemoteInput: SSL context creation failed, aborting server start")
+        UIManager:show(InfoMessage:new {
+          text = _("Failed to initialize TLS. HTTPS is unavailable."),
+        })
+        return
+      end
+      self.server = server
       callback()
     end)
   else
     self.server = SimpleTCPServer:new {
       host = "*",
-      port = self.port,
+      port = self.server_port,
       receiveCallback = function(data, client)
         local client_ip, _ = client:getpeername()
         return self:handleRequest(data, client, client_ip)
@@ -283,16 +353,35 @@ function RemoteInput:startServer(callback)
 end
 
 -- ==================== 上下文管理 ====================
+-- 取当前会话针对的批注对象（含有效性校验）。
+-- 返回值：annotation, index（index 为该对象在当前批注数组中的下标，用于删除）。
+function RemoteInput:getActiveAnnotation()
+  if self.context_type ~= "annotation" then return nil end
+  local annotation = self.context_data and self.context_data.annotation
+  if not annotation then return nil end
+  local annotations = self.ui.annotation and self.ui.annotation.annotations
+  if not annotations then return nil end
+  -- 引用必须仍能在批注数组中找到，防止换书或删除批注后写错对象
+  local index = self.context_data.highlight_index
+  if annotations[index] == annotation then
+    return annotation, index
+  end
+  for i, a in ipairs(annotations) do
+    if a == annotation then
+      return a, i
+    end
+  end
+  return nil
+end
+
 function RemoteInput:getCurrentText()
   if self.context_type == "annotation" then
-    local annotation = self.ui.annotation.annotations[self.context_data.highlight_index]
-    if annotation and annotation.note then
-      return annotation.note
-    end
-    return ""
+    local annotation = self:getActiveAnnotation()
+    return (annotation and annotation.note) or ""
   elseif self.context_type == "input" then
-    if self.context_data.input_dialog and self.context_data.input_dialog.getInputText then
-      return self.context_data.input_dialog:getInputText() or ""
+    local dialog = self.context_data and self.context_data.input_dialog
+    if dialog and dialog.getInputText then
+      return dialog:getInputText() or ""
     end
     return ""
   end
@@ -302,7 +391,7 @@ end
 function RemoteInput:applyRemoteText(text)
   if self.context_type == "annotation" then
     UIManager:nextTick(function()
-      local annotation = self.ui.annotation.annotations[self.context_data.highlight_index]
+      local annotation = self:getActiveAnnotation()
       if annotation then
         local old_note = annotation.note
         if old_note ~= text then
@@ -323,16 +412,17 @@ function RemoteInput:applyRemoteText(text)
     end)
   elseif self.context_type == "input" then
     UIManager:nextTick(function()
-      if self.context_data.input_dialog and self.context_data.input_dialog.setInputText then
-        if not self.context_data.input_dialog.readonly then
-          self.context_data.input_dialog:setInputText(text, true)
-        end
+      local dialog = self.context_data and self.context_data.input_dialog
+      if dialog and dialog.setInputText and not dialog.readonly then
+        dialog:setInputText(text, true)
       end
     end)
   end
   self.last_known_remote_text = text
-  self.server_dirty = false
-  self.context_version = self.context_version + 1
+  -- 标记需要同步：让其他空闲的网页客户端（多页签）也能跟进文本变化。
+  -- 注意：这里不递增 context_version —— version 只承载"上下文切换"语义，
+  -- 否则前端会把普通文本更新误判为切换，强制覆盖正在输入的一端。
+  self.server_dirty = true
 end
 
 function RemoteInput:getContextInfo()
@@ -341,8 +431,13 @@ function RemoteInput:getContextInfo()
   if self.context_type == "annotation" then
     heading = "Add Note"
   elseif self.context_type == "input" then
-    heading = "Input Text"
-    if self.context_data.input_dialog and not self.context_data.input_dialog.allow_newline then
+    local dialog = self.context_data and self.context_data.input_dialog
+    if dialog and dialog.title and dialog.title ~= "" then
+      heading = dialog.title
+    else
+      heading = "Input Text"
+    end
+    if dialog and not dialog.allow_newline then
       input_type = "input"
     end
   end
@@ -360,16 +455,103 @@ function RemoteInput:getContextInfo()
   }
 end
 
+-- ==================== 空闲自动停止 ====================
+function RemoteInput:touchActivity()
+  self.last_activity = os.time()
+end
+
+function RemoteInput:scheduleIdleCheck()
+  local minutes = self.idle_minutes
+  if not minutes or minutes <= 0 then return end
+  local gen = self.session_gen
+  UIManager:scheduleIn(minutes * 60, function()
+    self:checkIdle(gen)
+  end)
+end
+
+function RemoteInput:checkIdle(gen)
+  if gen ~= self.session_gen or not self.session_active then return end
+  local minutes = self.idle_minutes
+  if not minutes or minutes <= 0 then return end
+  local limit = minutes * 60
+  local elapsed = os.time() - (self.last_activity or os.time())
+  if elapsed < limit then
+    -- 期间有过实质活动，按剩余时间续期
+    UIManager:scheduleIn(limit - elapsed + 5, function()
+      self:checkIdle(gen)
+    end)
+    return
+  end
+  logger.info("RemoteInput: auto-stopping session after inactivity")
+  self:cleanupSession()
+  UIManager:show(InfoMessage:new {
+    text = _("RemoteInput session stopped after inactivity."),
+  })
+end
+
 -- ==================== 清理逻辑 ====================
 function RemoteInput:cleanupSession()
+  self.session_gen = (self.session_gen or 0) + 1 -- 使挂起的空闲检查失效
   self:CloseServer()
-  if self.context_type == "annotation" and self.context_data.is_new_note and self.context_data.highlight_index then
-    logger.info("RemoteInput: Removing cancelled highlight")
-    self.ui.highlight:deleteHighlight(self.context_data.highlight_index)
+  if self.context_type == "annotation" and self.context_data and self.context_data.is_new_note then
+    local annotation, index = self:getActiveAnnotation()
+    if annotation then
+      local note = annotation.note
+      if note == nil or note == "" then
+        -- 只删除没有输入任何内容的占位高亮；已输入内容的保留，避免丢数据
+        logger.info("RemoteInput: Removing cancelled empty highlight")
+        if index and self.ui.highlight.deleteHighlight then
+          self.ui.highlight:deleteHighlight(index)
+        end
+      end
+    end
   end
   if self.dialog then
     UIManager:close(self.dialog)
     self.dialog = nil
+  end
+  self.context_type = nil
+  self.context_data = nil
+end
+
+-- 文档关闭时使用：只终止会话，不清理批注（内容随文档保存）
+function RemoteInput:abortSession()
+  if not self.session_active then return end
+  self.session_gen = (self.session_gen or 0) + 1
+  self:CloseServer()
+  if self.dialog then
+    UIManager:close(self.dialog)
+    self.dialog = nil
+  end
+  self.context_type = nil
+  self.context_data = nil
+end
+
+-- ==================== 自动跟随输入焦点 ====================
+-- 会话活跃时，设备上新获得键盘焦点的输入框会静默接管远程上下文：
+-- 不弹窗、不收键盘，网页端通过轮询自动跟进。
+function RemoteInput:autoSwitchToInputDialog(dialog)
+  if not self.auto_switch or not self.session_active or not self.server then return end
+  if not self.context_type then return end
+  if dialog._remoteinput_no_autoswitch then return end
+  if self.context_type == "input" and self.context_data.input_dialog == dialog then return end
+  if self._switching then return end
+  self._switching = true
+  local ok, err = pcall(function()
+    if self.dialog then
+      UIManager:close(self.dialog)
+      self.dialog = nil
+    end
+    self.context_type = "input"
+    self.context_data = { input_dialog = dialog }
+    self.context_version = self.context_version + 1
+    self.last_known_remote_text = self:getCurrentText()
+    self.server_dirty = false
+    self:touchActivity()
+  end)
+  self._switching = nil
+  if not ok then
+    logger.err("RemoteInput: auto-switch failed:", err)
   end
 end
 
@@ -378,16 +560,22 @@ function RemoteInput:openRemoteSession(context_type, context_data)
   self.context_type = context_type
   self.context_data = context_data
 
+  if context_type == "annotation" then
+    -- 持有批注对象引用而不是裸下标，避免会话期间数组移位或换书后误写
+    local annotations = self.ui.annotation and self.ui.annotation.annotations
+    context_data.annotation = annotations and annotations[context_data.highlight_index] or nil
+  end
+
   if context_type == "input" and context_data.input_dialog and context_data.input_dialog.onCloseKeyboard then
     context_data.input_dialog:onCloseKeyboard()
   end
 
-  -- 如果服务器已经在运行，只需切换上下文
+  -- 服务器已在运行：仅切换上下文
   if self.session_active and self.server then
     self.context_version = self.context_version + 1
     self.last_known_remote_text = self:getCurrentText()
     self.server_dirty = false
-    -- 如果当前弹窗还在，更新它
+    self:touchActivity()
     if self.dialog then
       UIManager:close(self.dialog)
     end
@@ -395,45 +583,45 @@ function RemoteInput:openRemoteSession(context_type, context_data)
     return
   end
 
-  -- 首次启动：关闭旧服务器（如果有残留），启动新服务器
+  -- 首次启动：关闭残留服务器，启动新服务器
   self:CloseServer()
 
   local ip = get_local_ip()
-  if not ip or ip == "" then
+  if not ip then
     UIManager:show(InfoMessage:new {
-      text = _("Could not determine local IP address."),
+      text = _("Could not determine local IP address. Check that Wi-Fi is enabled."),
     })
     return
   end
 
-  if Device:isKindle() then
-    os.execute(string.format("%s %s %s",
-      "iptables -A INPUT -p tcp --dport", self.port,
-      "-m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT"))
-    os.execute(string.format("%s %s %s",
-      "iptables -A OUTPUT -p tcp --sport", self.port,
-      "-m conntrack --ctstate ESTABLISHED -j ACCEPT"))
-  end
-
-  self.context_version = 0
+  self.session_gen = (self.session_gen or 0) + 1
+  self.session_id = tostring(os.time()) .. "-" .. tostring(math.floor(math.random() * 1000000))
+  self.context_version = (self.context_version or 0) + 1
   self.last_known_remote_text = ""
   self.server_dirty = false
+  self:touchActivity()
+  -- 记录启动时实际使用的端口，防止会话期间改端口后防火墙规则删错对象
+  self.server_port = self.port
 
   self:startServer(function()
-    UIManager:insertZMQ(self.server)
+    -- 规则的添加与删除都收敛在这个回调里，与 startServer 内部的失败路径严格配对
+    addFirewallRules(self.server_port)
     local ok_server, err = self.server:start()
     if not ok_server then
       self.server = nil
+      removeFirewallRules(self.server_port)
       UIManager:show(InfoMessage:new {
         text = T(_("Failed to start server: %1"), err),
       })
       return
     end
-
+    -- 只有启动成功后才接入事件循环，避免留下不可用的 ZMQ 对象
+    UIManager:insertZMQ(self.server)
     self.session_active = true
+    self:scheduleIdleCheck()
 
     local protocol = self.https_enabled and "https" or "http"
-    local server_url = string.format("%s://%s:%d/", protocol, ip, self.port)
+    local server_url = string.format("%s://%s:%d/", protocol, ip, self.server_port)
     local qr_size = Device.screen:scaleBySize(350)
 
     local ok_ui, dialog_or_err = pcall(function()
@@ -531,7 +719,10 @@ function RemoteInput:showPersistentDialog()
   }
   local available_width = dialog:getAddedWidgetAvailableWidth()
   local info = self:getContextInfo()
-  local text_content = T(_("Session active. Editing: %1\nSwitch to another input to edit it without reconnecting."), info.heading)
+  local text_content = T(_("Session active. Editing: %1"), info.heading)
+  if self.idle_minutes and self.idle_minutes > 0 then
+    text_content = text_content .. "\n" .. T(_("Auto-stops after %1 minutes of inactivity."), self.idle_minutes)
+  end
   local text_widget = TextBoxWidget:new {
     text = text_content,
     face = self.dialog_font_face,
@@ -555,24 +746,24 @@ function RemoteInput:handleRequest(data, client, client_ip)
   local path = uri:match("^([^?]*)") or uri
 
   if method == "GET" and (path == "/" or path == "" or path == "/index.html") then
-    -- 首页：返回交互式 Web 页面
+    -- 首页：返回交互式 Web 页面（初始文本由前端首次轮询填充）
+    self:touchActivity()
     local info = self:getContextInfo()
-    local current_text = util.htmlEscape(self:getCurrentText())
-    local html = self:buildWebPage(info, current_text)
-    sendHtmlResponse(client, html)
+    sendHtmlResponse(client, self:buildWebPage(info))
 
   elseif method == "GET" and path == "/api/state" then
     -- 获取当前状态（供前端轮询）
     local info = self:getContextInfo()
-    local state = {
+    sendJsonResponse(client, {
       text = self:getCurrentText(),
       heading = info.heading,
       input_type = info.input_type,
       context_type = info.context_type,
       version = info.version,
+      dirty = info.dirty,
+      sid = self.session_id,
       server_active = self.session_active,
-    }
-    sendJsonResponse(client, state)
+    })
 
   elseif method == "POST" and path == "/api/text" then
     -- 实时文本同步（远程 → KOReader）
@@ -582,42 +773,42 @@ function RemoteInput:handleRequest(data, client, client_ip)
       sendEmptyResponse(client, 400)
       return
     end
-    -- 支持 JSON 格式: {"text":"..."}
     local text
-    if body:sub(1, 9) == '{"text":"' and body:sub(-2) == '"}' then
-      text = body:sub(10, -3)
-      text = text:gsub('\\"', '"'):gsub('\\n', '\n'):gsub('\\r', '\r'):gsub('\\t', '\t'):gsub('\\\\', '\\')
+    -- 标准 JSON：{"text": "..."}，由完整解析器正确处理各类转义
+    local decoded = jsonutil.decode(body)
+    if type(decoded) == "table" and type(decoded.text) == "string" then
+      text = decoded.text
     end
-    -- 支持 form-encoded: text=...
+    -- 表单编码：text=...
     if not text then
-      text = body:match("^text=(.+)")
+      text = body:match("^text=(.*)$")
       if text then
         text = text:gsub("%+", " "):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
       end
     end
-    -- 兜底：纯文本 body
-    if not text then
+    -- 兜底：纯文本 body。以 { 开头的视为损坏的 JSON，避免整段 JSON 进入正文
+    if not text and body ~= "" and not body:match("^%s*%{") then
       text = body
     end
-    if text and text ~= "" then
+    if text then
       self:applyRemoteText(text)
-      sendJsonResponse(client, { ok = true, version = self.context_version, dirty = false })
+      self:touchActivity()
+      sendJsonResponse(client, { ok = true, version = self.context_version, dirty = self.server_dirty })
     else
-      sendJsonResponse(client, { ok = false, error = "empty text" }, 400)
+      sendJsonResponse(client, { ok = false, error = "missing text" }, 400)
     end
 
   elseif method == "POST" and path == "/api/submit" then
-    -- 手动提交（用于 annotation 场景的最终保存确认）
-    local info = self:getContextInfo()
+    -- 手动提交：仅限批注场景，最终保存并结束会话
+    if self.context_type ~= "annotation" then
+      sendJsonResponse(client, { ok = false, error = "not available in this context" }, 400)
+      return
+    end
     UIManager:show(InfoMessage:new {
       text = _("Remote note saved!"),
     })
-    if self.dialog then
-      UIManager:close(self.dialog)
-      self.dialog = nil
-    end
-    self:CloseServer()
     sendJsonResponse(client, { ok = true, closed = true })
+    self:cleanupSession()
 
   else
     -- 未匹配的路由
@@ -626,25 +817,24 @@ function RemoteInput:handleRequest(data, client, client_ip)
 end
 
 -- ==================== Web 前端页面 ====================
-function RemoteInput:buildWebPage(info, initial_text)
-  local heading = info.heading
+function RemoteInput:buildWebPage(info)
+  local heading = util.htmlEscape(info.heading)
   local input_type = info.input_type
-  local context_type = info.context_type
   local version = info.version
 
   local input_html
   if input_type == "input" then
-    input_html = '<input type="text" id="editor" value="' .. initial_text .. '" placeholder="Type here..." style="width:100%; height:50px; font-size:18px; box-sizing:border-box; padding:8px;">'
+    input_html = '<input type="text" id="editor" placeholder="Type here..." style="width:100%; height:50px; font-size:18px; box-sizing:border-box; padding:8px;">'
   else
-    input_html = '<textarea id="editor" style="width:100%; height:240px; font-size:16px; box-sizing:border-box; padding:8px; resize:vertical;">' .. initial_text .. '</textarea>'
+    input_html = '<textarea id="editor" style="width:100%; height:240px; font-size:16px; box-sizing:border-box; padding:8px; resize:vertical;"></textarea>'
   end
 
   local submit_button = ""
-  if context_type == "annotation" then
+  if info.context_type == "annotation" then
     submit_button = '<button id="submitBtn" style="width:100%; height:44px; margin-top:12px; font-size:16px; background:#4a90d9; color:#fff; border:none; border-radius:6px;">Save &amp; Close</button>'
   end
 
-  return [[<!DOCTYPE html>
+  return [==[<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -668,12 +858,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 <body>
 <div class="container">
   <div class="header">
-    <h2 id="heading">]] .. heading .. [[</h2>
+    <h2 id="heading">]==] .. heading .. [==[</h2>
     <span class="status connected" id="status">&#9679; Connected</span>
   </div>
-  ]] .. input_html .. [[
+  ]==] .. input_html .. [==[
   <div class="hint" id="hint">Text syncs automatically as you type</div>
-  ]] .. submit_button .. [[
+  ]==] .. submit_button .. [==[
 </div>
 
 <script>
@@ -681,8 +871,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 // 规则：谁在打字谁说了算——isDirty=true 的一方拥有编辑权，
 // 另一端绝不覆盖。isDirty=false 表示空闲，乐意接受远端更新。
 (function(){
-  var lastVersion = ]] .. tostring(version) .. [[;
-  var lastSyncedText = ]] .. jsonEncode(initial_text) .. [[;
+  var lastVersion = ]==] .. tostring(version) .. [==[;
+  var lastSyncedText = null;
+  var sessionId = null;
   var editor = document.getElementById('editor');
   var heading = document.getElementById('heading');
   var statusEl = document.getElementById('status');
@@ -693,18 +884,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   var syncTimer = null;
   var pollTimer = null;
   var failCount = 0;
-  var currentInputType = ']] .. input_type .. [[';
+  var currentInputType = ']==] .. input_type .. [==[';
+  var ended = false;
+  var lastActivity = Date.now();
+
+  // 自适应轮询：交互后 10 秒内快轮询，空闲后进入慢轮询；
+  // 页面切到后台时更慢，降低对低端阅读器和手机电量的影响
+  var POLL_FAST = 600, POLL_SLOW = 2000, POLL_HIDDEN = 5000, ACTIVE_MS = 10000;
+
+  function touch() { lastActivity = Date.now(); }
 
   function setDirty(v) {
     isDirty = v;
+    if (dirtyTimer) { clearTimeout(dirtyTimer); dirtyTimer = null; }
     if (v) {
       // 安全网：10 秒后强制释放 dirty，防止网络失败导致的永久锁死
-      if (dirtyTimer) clearTimeout(dirtyTimer);
-      dirtyTimer = setTimeout(function() {
-        isDirty = false;
-      }, 10000);
-    } else {
-      if (dirtyTimer) clearTimeout(dirtyTimer);
+      dirtyTimer = setTimeout(function() { isDirty = false; }, 10000);
     }
   }
 
@@ -742,22 +937,48 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       });
   }
 
+  function markEnded(reason) {
+    if (ended) return;
+    ended = true;
+    setStatus('disconnected', '● ' + reason);
+    editor.disabled = true;
+    if (submitBtn) { submitBtn.disabled = true; }
+    if (hintEl) hintEl.textContent = 'Session has ended. You can close this page.';
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  }
+
+  function schedulePoll() {
+    if (pollTimer) clearTimeout(pollTimer);
+    var interval = document.hidden ? POLL_HIDDEN
+      : (Date.now() - lastActivity > ACTIVE_MS ? POLL_SLOW : POLL_FAST);
+    pollTimer = setTimeout(pollState, interval);
+  }
+
   function pollState() {
+    if (ended) return;
     fetch('/api/state')
       .then(function(r){ return r.json(); })
       .then(function(state){
         failCount = 0;
-        var serverDown = state.server_active === false;
-        if (serverDown) {
-          setStatus('disconnected', '● Session ended');
-          editor.disabled = true;
-          if (hintEl) hintEl.textContent = 'Session has ended. You can close this page.';
-          if (pollTimer) clearInterval(pollTimer);
+        // 会话标识：设备端重新开会话后，旧页面自动失效
+        if (sessionId === null) {
+          sessionId = state.sid || '';
+        } else if (state.sid && state.sid !== sessionId) {
+          markEnded('Session replaced');
+          return;
+        }
+        if (state.server_active === false) {
+          markEnded('Session ended');
           return;
         }
         setStatus('connected', '● Connected');
-        // 上下文切换（用户主动切换输入对象）：无条件接受
-        if (state.version !== lastVersion) {
+        if (lastSyncedText === null) {
+          // 首次载入：接受服务端当前文本
+          editor.value = state.text;
+          lastSyncedText = state.text;
+          touch();
+        } else if (state.version !== lastVersion) {
+          // 上下文切换（设备端切换了输入对象）：无条件接受
           lastVersion = state.version;
           heading.textContent = state.heading;
           if (state.input_type !== currentInputType) {
@@ -767,18 +988,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
               newEl = document.createElement('input');
               newEl.type = 'text';
               newEl.style.cssText = 'width:100%;height:50px;font-size:18px;box-sizing:border-box;padding:8px;display:block;border:1px solid #ddd;border-radius:8px;outline:none;transition:border-color .2s;';
-              editor.parentNode.insertBefore(newEl, editor);
-              editor.parentNode.removeChild(editor);
-              editor = newEl;
-              editor.id = 'editor';
             } else {
               newEl = document.createElement('textarea');
               newEl.style.cssText = 'width:100%;height:240px;font-size:16px;box-sizing:border-box;padding:8px;resize:vertical;display:block;border:1px solid #ddd;border-radius:8px;outline:none;transition:border-color .2s;';
-              editor.parentNode.insertBefore(newEl, editor);
-              editor.parentNode.removeChild(editor);
-              editor = newEl;
-              editor.id = 'editor';
             }
+            editor.parentNode.insertBefore(newEl, editor);
+            editor.parentNode.removeChild(editor);
+            editor = newEl;
+            editor.id = 'editor';
             bindEditorEvents();
           }
           setDirty(false);
@@ -786,23 +1003,32 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
           lastSyncedText = state.text;
           if (hintEl) hintEl.textContent = 'Switched to: ' + state.heading;
           setTimeout(function(){ if (hintEl) hintEl.textContent = 'Text syncs automatically as you type'; }, 2000);
+          touch();
         } else if (!isDirty && state.dirty && state.text !== editor.value) {
-          // 同一上下文：KOReader 侧有本地编辑，且 web 空闲 → 接受
+          // 同一上下文：另一端（设备或其他页签）有编辑且本端空闲 → 接受
           editor.value = state.text;
           lastSyncedText = state.text;
+          touch();
         }
+        schedulePoll();
       }).catch(function(){
         failCount++;
-        if (failCount >= 3) setStatus('disconnected', '● Offline');
+        if (failCount >= 3) {
+          setStatus('disconnected', '● Offline');
+          if (hintEl) hintEl.textContent = 'Connection lost. The reader may have ended the session.';
+        }
+        schedulePoll();
       });
   }
 
   function bindEditorEvents() {
     editor.addEventListener('input', function() {
+      touch();
       setDirty(true);
       debouncedSync();
     });
     editor.addEventListener('focus', function() {
+      touch();
       setDirty(true);
     });
     editor.addEventListener('blur', function() {
@@ -819,27 +1045,35 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
         .then(function(r){ return r.json(); })
         .then(function(data){
           if (data.closed) {
+            ended = true;
             setStatus('disconnected', '● Saved');
             editor.disabled = true;
             submitBtn.disabled = true;
             submitBtn.textContent = 'Saved ✓';
             if (hintEl) hintEl.textContent = 'Note saved. You can close this page.';
-            if (pollTimer) clearInterval(pollTimer);
+            if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
           }
+        }).catch(function(){
+          setStatus('disconnected', '● Offline');
         });
     });
   }
 
-  pollTimer = setInterval(pollState, 600);
+  document.addEventListener('visibilitychange', function() {
+    if (!ended && !document.hidden) { pollState(); }
+  });
+
   pollState();
 })();
 </script>
 </body>
-</html>]]
+</html>]==]
 end
 
 -- ==================== 注入远程编辑按钮 ====================
 function RemoteInput:injectRemoteInputButton(widget, index, is_new_note)
+  -- 笔记弹窗有自己的"Remote edit note"按钮，禁止通用输入框自动跟随劫持上下文
+  widget._remoteinput_no_autoswitch = true
   local buttons_table = widget.buttons or widget.buttons_table
   if not buttons_table then return end
   local remote_button_def = {
@@ -847,7 +1081,9 @@ function RemoteInput:injectRemoteInputButton(widget, index, is_new_note)
       text = _("Remote edit note"),
       callback = function()
         UIManager:close(widget)
-        self:openRemoteSession("annotation", { highlight_index = index, is_new_note = is_new_note })
+        NetworkMgr:runWhenConnected(function()
+          self:openRemoteSession("annotation", { highlight_index = index, is_new_note = is_new_note })
+        end)
       end,
     }
   }
@@ -877,6 +1113,8 @@ end
 function RemoteInput:show_port_dialog(touchmenu_instance)
   local port_dialog
   port_dialog = InputDialog:new {
+    -- 自家端口设置框不做远程注入/自动跟随
+    _remoteinput_skip = true,
     title = _("Remote Input Port"),
     input = tostring(self.port),
     input_type = "number",
@@ -898,6 +1136,11 @@ function RemoteInput:show_port_dialog(touchmenu_instance)
               self.port = value
               G_reader_settings:saveSetting("remoteinput_port", self.port)
               UIManager:close(port_dialog)
+              if self.session_active then
+                UIManager:show(InfoMessage:new {
+                  text = _("New port takes effect from the next session."),
+                })
+              end
               if touchmenu_instance then touchmenu_instance:updateItems() end
             else
               UIManager:show(InfoMessage:new {
@@ -929,6 +1172,28 @@ function RemoteInput:addToMainMenu(menu_items)
         separator = true,
       },
       {
+        text_func = function()
+          if self.idle_minutes and self.idle_minutes > 0 then
+            return T(_("Auto-stop after inactivity: %1 min"), self.idle_minutes)
+          end
+          return _("Auto-stop after inactivity: Off")
+        end,
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+          local values = { 0, 5, 15, 30, 60 }
+          local next_val = 15
+          for i, v in ipairs(values) do
+            if v == self.idle_minutes then
+              next_val = values[i % #values + 1]
+              break
+            end
+          end
+          self.idle_minutes = next_val
+          G_reader_settings:saveSetting("remoteinput_idle_minutes", next_val)
+          if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+      },
+      {
         text = _("Enable HTTPS"),
         checked_func = function()
           return self.https_enabled
@@ -950,10 +1215,12 @@ function RemoteInput:addToMainMenu(menu_items)
         callback = function()
           os.remove(cert_path)
           os.remove(key_path)
-          generateCerts(function()
-            UIManager:show(InfoMessage:new {
-              text = _("TLS certificates refreshed successfully."),
-            })
+          generateCerts(function(success)
+            if success then
+              UIManager:show(InfoMessage:new {
+                text = _("TLS certificates refreshed successfully."),
+              })
+            end
           end)
         end,
         separator = true,
@@ -970,6 +1237,17 @@ function RemoteInput:addToMainMenu(menu_items)
           UIManager:show(InfoMessage:new {
             text = _("Restart KOReader for changes to take effect."),
           })
+        end,
+      },
+      {
+        text = _("Follow newly opened input dialogs"),
+        checked_func = function()
+          return self.auto_switch
+        end,
+        callback = function(touchmenu_instance)
+          self.auto_switch = not self.auto_switch
+          G_reader_settings:saveSetting("remoteinput_autoswitch", self.auto_switch)
+          if touchmenu_instance then touchmenu_instance:updateItems() end
         end,
       },
       {
